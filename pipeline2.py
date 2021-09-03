@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import random
 
+# constants
+MAX_BATCH_INSERT_SIZE = 10000   # maximum number of entries to insert at once
+
 plt.rcParams["figure.figsize"] = (8,5.5)
 
 
@@ -38,20 +41,37 @@ class Stimulus(dj.Imported):     # subclass of session
         mat = spio.loadmat(filename, squeeze_me=True,struct_as_record=False) #load the data in .mat format
         data = mat[list(mat)[-1]] # unpack the dictionaries to select the specific data
 
-        # assemble for batch insert
-        trial_num = len(data.visCon)
-        stimdata = stimdata = [{
-            'mouse_id': key['mouse_id'],
-            'session_id': key['session_id'],
+        mouse_id = key['mouse_id']
+        session_id = key['session_id']
+        n_trials, n_neurons = data.deResp.shape
+        # batch insert stimulus data into Stimulus table
+        stimdata = [{
+            'mouse_id': mouse_id,
+            'session_id': session_id,
             'trial_id': trial_id,
             'visori': data.visOri[trial_id],
             'viscon': 0 if data.visCon[trial_id] == 0.1 else 1
-        } for trial_id in range(trial_num)]
+        } for trial_id in range(n_trials)]
         self.insert(stimdata)
-                
+        
+        # batch insert neural data into Neuralactivity table
+        neurdata = [{
+            'mouse_id': mouse_id,
+            'session_id': session_id,
+            'trial_id': trial_id,
+            'neuro_id': neuro_id,
+            'activity': data.deResp[trial_id, neuro_id]
+        } for trial_id in range(n_trials) for neuro_id in range(n_neurons)]
+        # limit number of simultaneously added entries. Not doing so seems to
+        # lead to database connection issues (LostConnectionError).
+        n_neurdata = len(neurdata)
+        for batch_i in range(0, n_neurdata, MAX_BATCH_INSERT_SIZE):
+            Neuralactivity.insert(
+                neurdata[batch_i:min(batch_i + MAX_BATCH_INSERT_SIZE,
+                                     n_neurdata)])
                 
 @schema
-class Neuralactivity(dj.Imported):     # subclass of stimulus
+class Neuralactivity(dj.Manual):     # subclass of stimulus
     definition = """
     # Neural Activity
     -> Stimulus
@@ -59,27 +79,7 @@ class Neuralactivity(dj.Imported):     # subclass of stimulus
     ---
     activity: float      # electric activity of the neuron
     """
- 
-    def make(self, key):       
 
-        filename = 'data/AJ0{mouse_id}_{session_id}'.format(**key) # get the filename of the session you are interested in
-        mat = spio.loadmat(filename, squeeze_me=True,struct_as_record=False) #load the data in .mat format
-        data = mat[list(mat)[-1]] # unpack the dictionaries to select the specific data
-
-        activity_arr = data.deResp
-        n_trials, n_neuron = activity_arr.shape 
-        
-        for neuro_id in range(0, n_neuron):
-            key['neuro_id'] = neuro_id
-            key['activity'] = activity_arr[int('{trial_id}'.format(**key)), neuro_id]
-            self.insert1(key)
-            
-#         count = 0
-#         if count <= n_neuron:
-#             key['neuro_id'] = count
-#             key['activity'] = activity_arr[int('{trial_id}'.format(**key)), count]
-#             count += 1
-#             self.insert1(key, skip_duplicates=True)
         
 @schema
 class ActivityStatistics(dj.Computed):
@@ -223,7 +223,6 @@ def pick_model(x, phi, model):
 def populate_new_data():
     
     Stimulus.populate(display_progress=True)
-    Neuralactivity.populate(display_progress=True)
     ActivityStatistics.populate(display_progress=True)
     Parameters.populate(display_progress=True)
     
