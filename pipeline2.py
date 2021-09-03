@@ -49,7 +49,7 @@ class Stimulus(dj.Imported):     # subclass of session
             key['visori'] = ori
             key['viscon'] = con
             trial_id += 1
-            self.insert1(key, skip_duplicates=True) 
+            self.insert1(key) 
                 
                 
 @schema
@@ -74,7 +74,7 @@ class Neuralactivity(dj.Imported):     # subclass of stimulus
         for neuro_id in range(0, n_neuron):
             key['neuro_id'] = neuro_id
             key['activity'] = activity_arr[int('{trial_id}'.format(**key)), neuro_id]
-            self.insert1(key, skip_duplicates=True)
+            self.insert1(key)
             
 #         count = 0
 #         if count <= n_neuron:
@@ -117,7 +117,7 @@ class ActivityStatistics(dj.Computed):
             key['stdev'] = activity.std()                # compute standard deviation
             key['max'] = activity.max()                  # compute max
             key['min'] = activity.min()                  # compute min
-            self.insert1(key, skip_duplicates=True)
+            self.insert1(key)
 
 @schema
 class Parameters(dj.Computed):
@@ -198,7 +198,7 @@ class Parameters(dj.Computed):
                 
                 key['params'] = params[lowest_j]
                 key['act_mean_per_ori'] = list(act_mean)
-                self.insert1(key, skip_duplicates=True)
+                self.insert1(key)
 
             
 
