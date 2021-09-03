@@ -100,28 +100,30 @@ class ActivityStatistics(dj.Computed):
     
     def make(self, key):
         # compute various statistics on neural activity
-        
+
         # find unique visori/viscon combinations for each neuron in session.
         # In the below, we first restrict Neuralactivity to the entries
         # corresponding to the session of interest and then perform the join
         # with Stimulus. This should be faster than first performing the join
         # and then subselecting entries relevant for the current session.
-        uniqueconds = dj.U('neuro_id', 'visori', 'viscon') & \
+        uniquestims = dj.U('neuro_id', 'visori', 'viscon') & \
             (Stimulus * (Neuralactivity
-                & 'mouse_id={mouse_id}'.format(**key)
-                & 'session_id="{session_id}"'.format(**key)))
-        
-        for stim in uniqueconds:            
-            
-            activity = ((Neuralactivity & 'neuro_id = {n}'.format(n=stim['neuro_id']))*
-                        (Stimulus & 'visori = {o}'.format(o=stim['visori']) & 'viscon = {c}'.format(c=stim['viscon']))
-                        ).fetch('activity')  # fetch activity as NumPy array
-            
+                         & 'mouse_id={mouse_id}'.format(**key)
+                         & 'session_id="{session_id}"'.format(**key)))
+
+        for stim in uniquestims:
+
+            activity = (
+                (Neuralactivity & 'neuro_id = {}'.format(stim['neuro_id'])) *
+                (Stimulus & 'visori = {}'.format(stim['visori'])
+                          & 'viscon = {}'.format(stim['viscon']))
+                ).fetch('activity')  # fetch activity as NumPy array
+
             key['neuro_id'] = stim['neuro_id']
             key['visori'] = stim['visori']
             key['viscon'] = stim['viscon']
             key['mean'] = activity.mean()                # compute mean
-            key['stdev'] = activity.std()                # compute standard deviation
+            key['stdev'] = activity.std()                # compute std
             key['max'] = activity.max()                  # compute max
             key['min'] = activity.min()                  # compute min
             self.insert1(key)
