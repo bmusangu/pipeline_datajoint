@@ -99,12 +99,19 @@ class ActivityStatistics(dj.Computed):
     """
     
     def make(self, key):
-        # compute various statistics on activity
+        # compute various statistics on neural activity
         
-        data = (dj.U('neuro_id') & (Neuralactivity & 'mouse_id={mouse_id}'.format(**key) & 
-                                    'session_id="{session_id}"'.format(**key))) * (dj.U('visori','viscon') & Stimulus)
+        # find unique visori/viscon combinations for each neuron in session.
+        # In the below, we first restrict Neuralactivity to the entries
+        # corresponding to the session of interest and then perform the join
+        # with Stimulus. This should be faster than first performing the join
+        # and then subselecting entries relevant for the current session.
+        uniqueconds = dj.U('neuro_id', 'visori', 'viscon') & \
+            (Stimulus * (Neuralactivity
+                & 'mouse_id={mouse_id}'.format(**key)
+                & 'session_id="{session_id}"'.format(**key)))
         
-        for stim in data:            
+        for stim in uniqueconds:            
             
             activity = ((Neuralactivity & 'neuro_id = {n}'.format(n=stim['neuro_id']))*
                         (Stimulus & 'visori = {o}'.format(o=stim['visori']) & 'viscon = {c}'.format(c=stim['viscon']))
