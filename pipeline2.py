@@ -10,6 +10,7 @@ import random
 
 # constants
 MAX_BATCH_INSERT_SIZE = 10000   # maximum number of entries to insert at once
+DATA_FOLDER = 'data'            # folder where data files are expected to reside
 
 plt.rcParams["figure.figsize"] = (8,5.5)
 
@@ -37,7 +38,8 @@ class Stimulus(dj.Imported):     # subclass of session
            
     def make(self, key):
         # load raw data
-        filename = 'data/AJ0{mouse_id}_{session_id}'.format(**key) # get the filename of the session you are interested in
+        filename = '{data_folder}/AJ0{mouse_id}_{session_id}'.format(
+            data_folder=DATA_FOLDER, **key) # get the filename of the session you are interested in
         mat = spio.loadmat(filename, squeeze_me=True,struct_as_record=False) #load the data in .mat format
         data = mat[list(mat)[-1]] # unpack the dictionaries to select the specific data
 
