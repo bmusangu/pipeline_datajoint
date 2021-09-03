@@ -33,23 +33,21 @@ class Stimulus(dj.Imported):     # subclass of session
     """
            
     def make(self, key):
-
+        # load raw data
         filename = 'data/AJ0{mouse_id}_{session_id}'.format(**key) # get the filename of the session you are interested in
         mat = spio.loadmat(filename, squeeze_me=True,struct_as_record=False) #load the data in .mat format
         data = mat[list(mat)[-1]] # unpack the dictionaries to select the specific data
-        
-        trial_id = 0
-        for ori,con in zip(data.visOri, data.visCon):
-            if con == 0.1:
-                con = 0
-            else:
-                con = 1
 
-            key['trial_id'] = trial_id
-            key['visori'] = ori
-            key['viscon'] = con
-            trial_id += 1
-            self.insert1(key) 
+        # assemble for batch insert
+        trial_num = len(data.visCon)
+        stimdata = stimdata = [{
+            'mouse_id': key['mouse_id'],
+            'session_id': key['session_id'],
+            'trial_id': trial_id,
+            'visori': data.visOri[trial_id],
+            'viscon': 0 if data.visCon[trial_id] == 0.1 else 1
+        } for trial_id in range(trial_num)]
+        self.insert(stimdata)
                 
                 
 @schema
