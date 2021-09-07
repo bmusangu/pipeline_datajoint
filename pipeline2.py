@@ -8,6 +8,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import random
 
+# constants
+MAX_BATCH_INSERT_SIZE = 10000   # maximum number of entries to insert at once
+DATA_FOLDER = 'data'            # folder where data files are expected to reside
+
 plt.rcParams["figure.figsize"] = (8,5.5)
 
 
@@ -33,27 +37,43 @@ class Stimulus(dj.Imported):     # subclass of session
     """
            
     def make(self, key):
-
-        filename = 'data/AJ0{mouse_id}_{session_id}'.format(**key) # get the filename of the session you are interested in
+        # load raw data
+        filename = '{data_folder}/AJ0{mouse_id}_{session_id}'.format(
+            data_folder=DATA_FOLDER, **key) # get the filename of the session you are interested in
         mat = spio.loadmat(filename, squeeze_me=True,struct_as_record=False) #load the data in .mat format
         data = mat[list(mat)[-1]] # unpack the dictionaries to select the specific data
-        
-        trial_id = 0
-        for ori,con in zip(data.visOri, data.visCon):
-            if con == 0.1:
-                con = 0
-            else:
-                con = 1
 
-            key['trial_id'] = trial_id
-            key['visori'] = ori
-            key['viscon'] = con
-            trial_id += 1
-            self.insert1(key, skip_duplicates=True) 
-                
+        mouse_id = key['mouse_id']
+        session_id = key['session_id']
+        n_trials, n_neurons = data.deResp.shape
+        # batch insert stimulus data into Stimulus table
+        stimdata = [{
+            'mouse_id': mouse_id,
+            'session_id': session_id,
+            'trial_id': trial_id,
+            'visori': data.visOri[trial_id],
+            'viscon': 0 if data.visCon[trial_id] == 0.1 else 1
+        } for trial_id in range(n_trials)]
+        self.insert(stimdata)
+        
+        # batch insert neural data into Neuralactivity table
+        neurdata = [{
+            'mouse_id': mouse_id,
+            'session_id': session_id,
+            'trial_id': trial_id,
+            'neuro_id': neuro_id,
+            'activity': data.deResp[trial_id, neuro_id]
+        } for trial_id in range(n_trials) for neuro_id in range(n_neurons)]
+        # limit number of simultaneously added entries. Not doing so seems to
+        # lead to database connection issues (LostConnectionError).
+        n_neurdata = len(neurdata)
+        for batch_i in range(0, n_neurdata, MAX_BATCH_INSERT_SIZE):
+            Neuralactivity.insert(
+                neurdata[batch_i:min(batch_i + MAX_BATCH_INSERT_SIZE,
+                                     n_neurdata)])
                 
 @schema
-class Neuralactivity(dj.Imported):     # subclass of stimulus
+class Neuralactivity(dj.Manual):     # subclass of stimulus
     definition = """
     # Neural Activity
     -> Stimulus
@@ -61,27 +81,7 @@ class Neuralactivity(dj.Imported):     # subclass of stimulus
     ---
     activity: float      # electric activity of the neuron
     """
- 
-    def make(self, key):       
 
-        filename = 'data/AJ0{mouse_id}_{session_id}'.format(**key) # get the filename of the session you are interested in
-        mat = spio.loadmat(filename, squeeze_me=True,struct_as_record=False) #load the data in .mat format
-        data = mat[list(mat)[-1]] # unpack the dictionaries to select the specific data
-
-        activity_arr = data.deResp
-        n_trials, n_neuron = activity_arr.shape 
-        
-        for neuro_id in range(0, n_neuron):
-            key['neuro_id'] = neuro_id
-            key['activity'] = activity_arr[int('{trial_id}'.format(**key)), neuro_id]
-            self.insert1(key, skip_duplicates=True)
-            
-#         count = 0
-#         if count <= n_neuron:
-#             key['neuro_id'] = count
-#             key['activity'] = activity_arr[int('{trial_id}'.format(**key)), count]
-#             count += 1
-#             self.insert1(key, skip_duplicates=True)
         
 @schema
 class ActivityStatistics(dj.Computed):
@@ -99,25 +99,34 @@ class ActivityStatistics(dj.Computed):
     """
     
     def make(self, key):
-        # compute various statistics on activity
-        
-        data = (dj.U('neuro_id') & (Neuralactivity & 'mouse_id={mouse_id}'.format(**key) & 
-                                    'session_id="{session_id}"'.format(**key))) * (dj.U('visori','viscon') & Stimulus)
-        
-        for stim in data:            
-            
-            activity = ((Neuralactivity & 'neuro_id = {n}'.format(n=stim['neuro_id']))*
-                        (Stimulus & 'visori = {o}'.format(o=stim['visori']) & 'viscon = {c}'.format(c=stim['viscon']))
-                        ).fetch('activity')  # fetch activity as NumPy array
-            
+        # compute various statistics on neural activity
+
+        # find unique visori/viscon combinations for each neuron in session.
+        # In the below, we first restrict Neuralactivity to the entries
+        # corresponding to the session of interest and then perform the join
+        # with Stimulus. This should be faster than first performing the join
+        # and then subselecting entries relevant for the current session.
+        uniquestims = dj.U('neuro_id', 'visori', 'viscon') & \
+            (Stimulus * (Neuralactivity
+                         & 'mouse_id={mouse_id}'.format(**key)
+                         & 'session_id="{session_id}"'.format(**key)))
+
+        for stim in uniquestims:
+
+            activity = (
+                (Neuralactivity & 'neuro_id = {}'.format(stim['neuro_id'])) *
+                (Stimulus & 'visori = {}'.format(stim['visori'])
+                          & 'viscon = {}'.format(stim['viscon']))
+                ).fetch('activity')  # fetch activity as NumPy array
+
             key['neuro_id'] = stim['neuro_id']
             key['visori'] = stim['visori']
             key['viscon'] = stim['viscon']
             key['mean'] = activity.mean()                # compute mean
-            key['stdev'] = activity.std()                # compute standard deviation
+            key['stdev'] = activity.std()                # compute std
             key['max'] = activity.max()                  # compute max
             key['min'] = activity.min()                  # compute min
-            self.insert1(key, skip_duplicates=True)
+            self.insert1(key)
 
 @schema
 class Parameters(dj.Computed):
@@ -198,7 +207,7 @@ class Parameters(dj.Computed):
                 
                 key['params'] = params[lowest_j]
                 key['act_mean_per_ori'] = list(act_mean)
-                self.insert1(key, skip_duplicates=True)
+                self.insert1(key)
 
             
 
@@ -225,7 +234,6 @@ def pick_model(x, phi, model):
 def populate_new_data():
     
     Stimulus.populate(display_progress=True)
-    Neuralactivity.populate(display_progress=True)
     ActivityStatistics.populate(display_progress=True)
     Parameters.populate(display_progress=True)
     
