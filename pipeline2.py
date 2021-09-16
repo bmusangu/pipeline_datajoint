@@ -5,8 +5,8 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
-import seaborn as sns
-import random
+import itertools
+import sys
 
 # constants
 MAX_BATCH_INSERT_SIZE = 10000   # maximum number of entries to insert at once
@@ -22,7 +22,7 @@ class Session(dj.Manual):
     definition = """
     # Session
     mouse_id:   int            # unique to a each mouse
-    session_id: date           # session ID given by the date of the session
+    session_date: date           # session date given by the date of the session
     """
     
 @schema
@@ -38,18 +38,18 @@ class Stimulus(dj.Imported):     # subclass of session
            
     def make(self, key):
         # load raw data
-        filename = '{data_folder}/AJ0{mouse_id}_{session_id}'.format(
+        filename = '{data_folder}/AJ0{mouse_id}_{session_date}'.format(
             data_folder=DATA_FOLDER, **key) # get the filename of the session you are interested in
         mat = spio.loadmat(filename, squeeze_me=True,struct_as_record=False) #load the data in .mat format
         data = mat[list(mat)[-1]] # unpack the dictionaries to select the specific data
 
         mouse_id = key['mouse_id']
-        session_id = key['session_id']
+        session_date = key['session_date']
         n_trials, n_neurons = data.deResp.shape
         # batch insert stimulus data into Stimulus table
         stimdata = [{
             'mouse_id': mouse_id,
-            'session_id': session_id,
+            'session_date': session_date,
             'trial_id': trial_id,
             'visori': data.visOri[trial_id],
             'viscon': 0 if data.visCon[trial_id] == 0.1 else 1
@@ -59,7 +59,7 @@ class Stimulus(dj.Imported):     # subclass of session
         # batch insert neural data into Neuralactivity table
         neurdata = [{
             'mouse_id': mouse_id,
-            'session_id': session_id,
+            'session_date': session_date,
             'trial_id': trial_id,
             'neuro_id': neuro_id,
             'activity': data.deResp[trial_id, neuro_id]
@@ -109,14 +109,14 @@ class ActivityStatistics(dj.Computed):
         uniquestims = dj.U('neuro_id', 'visori', 'viscon') & \
             (Stimulus * (Neuralactivity
                          & 'mouse_id={mouse_id}'.format(**key)
-                         & 'session_id="{session_id}"'.format(**key)))
+                         & 'session_date="{session_date}"'.format(**key)))
 
         for stim in uniquestims:
 
             activity = (
-                (Neuralactivity & 'neuro_id = {}'.format(stim['neuro_id'])) *
-                (Stimulus & 'visori = {}'.format(stim['visori'])
-                          & 'viscon = {}'.format(stim['viscon']))
+                (Neuralactivity & 'neuro_id = {}'.format(stim['neuro_id'])) * 
+                (Stimulus & 'visori = {}'.format(stim['visori']) 
+                          & 'viscon = {}'.format(stim['viscon'])) 
                 ).fetch('activity')  # fetch activity as NumPy array
 
             key['neuro_id'] = stim['neuro_id']
@@ -129,10 +129,13 @@ class ActivityStatistics(dj.Computed):
             self.insert1(key)
 
 @schema
-class Parameters(dj.Computed):
+class TuningCurveFits(dj.Computed):
     definition = """
     # Results
-    -> ActivityStatistics   
+    -> Session 
+    neuro_id: int        # unique
+    viscon:   int        # Trials value indicating the contrast of visual stimuli
+    model_id: varchar(5) # Type of model being fitted
     ---
     params: longblob            # set of parameters from computations
     act_mean_per_ori: longblob  # set of activity means per orientation for each neuron
@@ -141,73 +144,74 @@ class Parameters(dj.Computed):
     def make(self, key):
         
         # get the number of neurons per_session
-        n_neurons_sess = len(dj.U('neuro_id').aggr(Neuralactivity & 'mouse_id={mouse_id}'.format(**key) 
-                         & 'session_id="{session_id}"'.format(**key), n="count(*)"))
-        
-        list_act_mean = {}
-        model_list = ['m1', 'm2'] 
+        n_neurons_sess = len(dj.U('neuro_id') & 
+            (Neuralactivity & 'mouse_id={mouse_id}'.format(**key) 
+                & 'session_date="{session_date}"'.format(**key)))
 
-        for n_id in range(n_neurons_sess):
-            
-            for model in model_list:
+        model_list = ['m4p', 'm5p']                    # list of models
+        uniquecons = (dj.U('viscon') & ActivityStatistics)  
 
-                # fetch the neural activity and orietation 
-                ori, act = ((Neuralactivity & 'mouse_id={mouse_id}'.format(**key) & 'session_id="{session_id}"'.format(**key)
-                             & 'neuro_id={neuro_id}'.format(**key))
-                            * (Stimulus & 'viscon={viscon}'.format(**key))).fetch('visori', 'activity')
+        for model in model_list:
+            for con_id in uniquecons:
+                for n_id in range(n_neurons_sess):
+                    # fetch the neural activity and orietation 
+                    ori, act = ((Neuralactivity 
+                            & 'mouse_id={mouse_id}'.format(**key) 
+                            & 'session_date="{session_date}"'.format(**key) 
+                            & f'neuro_id={n_id}') * 
+                            (Stimulus & f'viscon={con_id["viscon"]}') 
+                        ).fetch('visori', 'activity')
 
-                visori_con = pd.DataFrame(np.vstack((ori, act)).T)
-                visori_con.columns = ['ori', 'act']
-                means = pd.DataFrame(visori_con.groupby('ori')['act'].mean()).reset_index()
-                act_mean = means.act
-                ori_mean = means.ori*(np.pi/180.0)
-                ori = ori*(np.pi/180.0)
-                sigma = visori_con.act.std()
+                    vis_ori_con = pd.DataFrame(data={'ori': ori, 'act': act})
+                    mean_act_by_ori = pd.DataFrame(vis_ori_con.groupby('ori')['act'].mean()).reset_index()
+                    mean_act = mean_act_by_ori.act
+                    ori = ori*(np.pi/180.0)
 
-                if model == 'm2':            
-                    # initialize with random starting points
-                    x0_arr = [0.01 + 0.2 * np.random.randint(1, 5, 5) for x in range(9)] 
-                    a = min(act_mean)
-                    b = (max(act_mean)-min(act_mean))/2.0
-                    b2 = max(act_mean)/2.0
+                    # creating a list of 10 initial starting point
+                    # 9 random ones and one set (a, b, b2, c, theta_p) intelligent guess
+                    # here a, b, b2, c, theta_p correspond to the initial guesses of the model params 
+                    ini_rang = 9 
+                    a = min(mean_act)
+                    b = (max(mean_act)-min(mean_act))/2.0
+                    b2 = max(mean_act)/2.0
                     c = 90*(np.pi/180.0)
-                    theta_p = max(act_mean)*(np.pi/180.0)
-                    x0_arr.append(np.array([a, b, c, theta_p, b2])) # initial guesses
-                else:
-                    # initialize with random starting points
-                    x0_arr = [0.01 + 0.2 * np.random.randint(1, 4, 4) for x in range(9)]
-                    a = min(act_mean)
-                    b = (max(act_mean)-min(act_mean))/2.0
-                    c = 90 * (np.pi/180.0)
-                    theta_p = max(act_mean)*(np.pi/180.0)
-                    x0_arr.append(np.array([a, b, c, theta_p])) # initial guesses 
+                    theta_p = max(mean_act)*(np.pi/180.0)
 
-                def L_fun(x):
-                    if model == 'm2':
-                        activity = act_mean
-                        J = np.mean(((activity - model_fun2(x, ori_mean))/sigma)**2.0)
-                    else:
-                        activity = act
-                        J = np.mean((activity - model_fun1(x, ori))**2.0)
-                    return J           
+                    # initial guess for model with 5 params
+                    x0_5p = [0.01 + 0.2 * np.random.randint(1, 5, 5) for x in range(ini_rang)]
+                    x5p = [np.array([a, b, c, theta_p, b2])]
+                    # initial guess for model with 4 params
+                    x0_4p = [0.01 + 0.2 * np.random.randint(1, 4, 4) for x in range(ini_rang)]
+                    x4p = [np.array([a, b, c, theta_p])]
 
-                params = {}
-                c = 0
-                for x0 in x0_arr:
+                    # generate the x0 array by combing the intelligent guess with the random one
+                    x0_arr = list(itertools.chain(x0_5p, x5p)) if model == 'm5p' \
+                        else list(itertools.chain(x0_4p, x4p))
 
-                    res = minimize(L_fun, x0, options={'disp':False})
-                    params[c] = (res.x)
-                    c += 1
+                    # loss function (objective function too)
+                    def L_fun(x):
+                        if model == 'm5p':
+                            J = np.mean((act - model_fun2(x, ori))**2.0)
+                        else:
+                            J = np.mean((act - model_fun1(x, ori))**2.0)
+                        return J           
 
-                j_list = {}
-                for x0 in [*params]:
-                    J = L_fun(params[x0])
-                    j_list[x0] = J
-                lowest_j = min(j_list, key=j_list.get)
-                
-                key['params'] = params[lowest_j]
-                key['act_mean_per_ori'] = list(act_mean)
-                self.insert1(key)
+                    # get size of parameter vector from first element in x0_arr
+                    params = np.empty(len(x0_arr[0]))
+                    min_obj = np.Inf
+                    # fit tuning curves, using random restart
+                    for x0 in x0_arr:
+                        res = minimize(L_fun, x0, options={'disp':False})
+                        if res.fun < min_obj:
+                            params = res.x
+                            min_obj = res.fun
+
+                    key['neuro_id'] = n_id
+                    key['viscon'] = con_id['viscon']
+                    key['model_id'] = model                 
+                    key['params'] = params
+                    key['act_mean_per_ori'] = list(mean_act)
+                    self.insert1(key)
 
             
 
@@ -219,180 +223,117 @@ def model_fun1(x, theta):
 
 # model function 2    
 def model_fun2(x, theta):    
-    return x[0] + (x[1] * np.exp(x[2] * np.cos(theta - x[3]))) + (x[4] * np.exp(-x[2] * np.cos(theta - x[3])))
+    return x[0] + (x[1] * np.exp(x[2] * np.cos(theta - x[3]))) + (x[4] * \
+        np.exp(-x[2] * np.cos(theta - x[3])))
 
-#--------------------------------------------------------Helper Methods-------------------------------------------------------
+#--------------------------------------------------------Helper Methods------------------------------------------------
 
+# auto populate: call this function to populate tables with new data
+def populate_new_data():
+    
+    Stimulus.populate(display_progress=True)
+    ActivityStatistics.populate(display_progress=True)
+    TuningCurveFits.populate(display_progress=True)
+    
+    print("All tables are populated.")
+
+# helps pick a model based on input
 def pick_model(x, phi, model): 
-    if model == 'm2':
+    if model == 'm5p':
         model = model_fun2(x, phi)
     else:
         model = model_fun1(x, phi)
     return model
 
-# auto populate
-def populate_new_data():
-    
-    Stimulus.populate(display_progress=True)
-    ActivityStatistics.populate(display_progress=True)
-    Parameters.populate(display_progress=True)
-    
-    print("All tables are populated.")
-    
+# Since not all sessions have two contrast
+# there are two possible values for contrast: low=0, high=1
+# we need to check if the entered contrast is in the session
+def check_contrast(mouse_id, session_date, viscon):
+
+   # get the viscon from session
+    contrasts = [con['viscon'] for con in \
+        (dj.U('viscon') 
+        & (Stimulus 
+        & f'mouse_id={mouse_id}' 
+        & f'session_date="{session_date}"'))]
+
+    while True:
+        if viscon not in contrasts:
+            print("The visual contrast you entered is not in this session")
+            print(f'The available contrast(s) in AJ0{mouse_id}_{session_date} is: {contrasts}')
+            answer = int(input('To continue, enter the available contrast options:'))
+            if answer in contrasts:
+                new_con = answer
+                break
+    print(f'your new visual contrast is: {new_con}')
+    return new_con
+
+
+#-------------------------------------plots---------------------------------------------------------
+
+
 # plot of tuning curves
-def tuning_curve_plots(mouse_id, session_id, viscon, model):
-    
-    list_keys = (Parameters & f'mouse_id = {mouse_id}' & f'session_id = {session_id}' & f'viscon = {viscon}').fetch('KEY')
-    rand_keys = random.sample(list_keys, 16)
-    ori_mean = (dj.U('visori') & Parameters.proj())
+def tuning_curve_plots(mouse_id, session_date, viscon):
 
-    for key in rand_keys:
-
-        act_mean = '{act_mean}'.format(**key)
-        x0 = '{params}'.format(**key)
-
-        # plot 16 random fitted tuning curves 
-        fig, axs = plt.subplots(4, 4, figsize=(15,10))
-        fig.suptitle("16 Randomly Fitted Tuning Curves", y=0.94, fontsize='xx-large')
-        best_param_keys = [*best_fit_params]
-        count = 0
-        for i in range(4):
-            for j in range(4):
-
-                axs[i, j].plot(ori_mean, act_mean)
-                phi = np.linspace(0,2*np.pi, 100)              
-                y = pick_model(x0, phi, model)
-                axs[i, j].plot(phi, y)
-                axs[i, j].set_title(f'Neuron {rand_nid[count]}')
-                count += 1
-
-    for ax in axs.flat:
-        ax.label_outer()
-        
-    # set labels
-    plt.setp(axs[-1, :], xlabel='Orientation')
-    plt.setp(axs[:, 0], ylabel='$\Delta$F/F')
-    
-
-#--------------------------------------------------------Random Methods-------------------------------------------------------
-
-
-def neuroAnalysis(m_id, sess_id, conid, model):
-    
-    """
-    Inputs:
-    m_id ---> mouse_id as int
-    sess_is ---> session_id as int: e.g. 190902 or str: '2019-09-02'
-    conid ---> contrast as int: high = 1 or low = 0
-    model ---> str: model with 4 parameters = 'm1' and it is the default model
-                    model with 5 parameters = 'm2'
-    --------------------------------------------------------------------------
-    Output:
-    plots of fitted tuning curves
-    """
+    # Since not all sessions have two contrast
+    # we need to check if the entered contrast is in the session
+    viscon = check_contrast(mouse_id, session_date, viscon)
 
     # get the number of neurons per_session
-    n_neurons_sess = len(dj.U('neuro_id').aggr(Neuralactivity & f'mouse_id={m_id}' & f'session_id={sess_id}', n="count(*)"))
-    
-    # generate randon neuroId
+    # and randonly sample neuroId from this range
+    n_neurons_sess = len(dj.U('neuro_id') & 
+        (Neuralactivity & f'mouse_id={mouse_id}' 
+            & f'session_date="{session_date}"'))
     rand_nid = np.random.randint(0, n_neurons_sess, 16)
-    
-    best_fit_params = {} # best fit params for each neuron
-    list_act_mean = {}
-    
-    for n_id in rand_nid:
-        
-        # fetch the neural activity and orietation 
-        ori, act = ((Neuralactivity & f'mouse_id={m_id}' & f'session_id={sess_id}' & f'neuro_id={n_id}')
-                    * (Stimulus & f'viscon={conid}')).fetch('visori', 'activity')
 
-        visori_con = pd.DataFrame(np.vstack((ori, act)).T)
-        visori_con.columns = ['ori', 'act']
-        means = pd.DataFrame(visori_con.groupby('ori')['act'].mean()).reset_index()
-        act_mean = means.act
-        ori_mean = means.ori*(np.pi/180.0)
-        ori = ori*(np.pi/180.0)
-        sigma = visori_con.act.std()
-        
-        if model == 'm2':            
-            # initialize with random starting points
-            x0_arr = [0.01 + 0.2 * np.random.randint(1, 5, 5) for x in range(9)] 
-            a = min(act_mean)
-            b = (max(act_mean)-min(act_mean))/2.0
-            b2 = max(act_mean)/2.0
-            c = 90*(np.pi/180.0)
-            theta_p = max(act_mean)*(np.pi/180.0)
-            x0_arr.append(np.array([a, b, c, theta_p, b2])) # initial guesses
-        else:
-            # initialize with random starting points
-            x0_arr = [0.01 + 0.2 * np.random.randint(1, 4, 4) for x in range(9)]
-            a = min(act_mean)
-            b = (max(act_mean)-min(act_mean))/2.0
-            c = 90 * (np.pi/180.0)
-            theta_p = max(act_mean)*(np.pi/180.0)
-            x0_arr.append(np.array([a, b, c, theta_p])) # initial guesses 
-        
-        def L_fun(x):
-            if model == 'm2':
-                activity = act_mean
-                J = np.mean(((activity - model_fun2(x, ori_mean))/sigma)**2.0)
-            else:
-                activity = act
-                J = np.mean((activity - model_fun1(x, ori))**2.0)
-            return J           
+    # get the orientations to use as x-axis ticks
+    ori_mean = [
+        o['visori']*(np.pi/180.0)
+        for o in (dj.U('visori') & ActivityStatistics)
+        ]
 
-        params = {}
-        c = 0
-        for x0 in x0_arr:
-            
-            res = minimize(L_fun, x0, options={'disp':False})
-            params[c] = (res.x)
-            c += 1
-            
-        j_list = {}
-        for x0 in [*params]:
-            J = L_fun(params[x0])
-            j_list[x0] = J
-        lowest_j = min(j_list, key=j_list.get)
-        best_fit_params[n_id] = params[lowest_j]
-        list_act_mean[n_id] = act_mean
-                                       
-    # plot 16 random fitted tuning curves 
-    fig, axs = plt.subplots(4, 4, figsize=(15,10))
-    fig.suptitle("16 Randomly Fitted Tuning Curves", y=0.94, fontsize='xx-large')
-    best_param_keys = [*best_fit_params]
-    count = 0
-    for i in range(4):
-        for j in range(4):
-        
-            axs[i, j].plot(ori_mean, list_act_mean[best_param_keys[count]])
-            phi = np.linspace(0,2*np.pi, 100)
-            x = best_fit_params[best_param_keys[count]]              
-            y = pick_model(x, phi, model)
-            axs[i, j].plot(phi, y)
-            axs[i, j].set_title(f'Neuron {rand_nid[count]}')
-            count += 1
-            
-    for ax in axs.flat:
-        ax.label_outer()
-        
-    # set labels
-    plt.setp(axs[-1, :], xlabel='Orientation')
-    plt.setp(axs[:, 0], ylabel='$\Delta$F/F')   
+
+    fig, axes = plt.subplots(4, 4, figsize=(15,10))
+    axes = axes.ravel()  # array to 1D
+
+    for n_id, ax in zip(rand_nid, axes):
+
+        model, params, mean_act = (TuningCurveFits \
+                    & f'mouse_id={mouse_id}' \
+                    & f'session_date="{session_date}"' \
+                    & f'neuro_id={n_id}' \
+                    & f'viscon={viscon}'\
+                ).fetch('model_id', 'params', 'act_mean_per_ori')
+
+        phi = np.linspace(0,2*np.pi, 100)
+        ax.plot(ori_mean, mean_act[0], label='mean_activity')
+        for model, params in zip(model, params):
+            y = pick_model(params, phi, f'{model}')
+         
+            ax.plot(phi, y, label=f'{model}')
+            ax.set_title(f'Neuron {n_id}')
+            ax.label_outer()
     
-        
-     
-        
-        
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper right') 
+    # add a big axis, hide frame
+    axfig = fig.add_subplot(111, frameon=False)
+    # hide tick and tick label of the big axis
+    plt.tick_params(
+        labelcolor='none', 
+        which='both', 
+        top=False, 
+        bottom=False, 
+        left=False, 
+        right=False
+        )
+    fig.suptitle(
+    f"16 Randomly Fitted Tuning Curves for Viscon={viscon} in AJ0{mouse_id}_{session_date}", \
+    y=0.94, fontsize='xx-large'
+    )
+    plt.xlabel('Orientation', fontdict={'fontsize': 20, 'fontweight': 'medium'})
+    plt.ylabel('$\\Delta$F/F', fontdict={'fontsize': 20, 'fontweight': 'medium'})
+    # Tweak spacing to prevent clipping of ylabel
+    axfig.yaxis.set_label_coords(-0.05,0.5)
     
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+
