@@ -389,6 +389,7 @@ def tuningCurvePlotsPerCon(mouse_id, session_date, model):
             ls='--')
         y0 = pick_model(params[0], phi, f'{model}')
         color = 'tab:red'
+        ax1.set_title(f'Neuron {n_id}')
         ax1.set_xticks([0, 1, 2, 3, 4, 5, 6, 7])
         ax1.set_xticklabels([45, 90, 135, 180, 225, 270, 315, 360])
         ax1.set_xlabel('Orientation($\\Theta$)')
