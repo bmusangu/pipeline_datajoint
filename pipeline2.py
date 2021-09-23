@@ -6,7 +6,6 @@ import pandas as pd
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 import itertools
-import sys
 
 # constants
 MAX_BATCH_INSERT_SIZE = 10000   # maximum number of entries to insert at once
@@ -22,7 +21,7 @@ class Session(dj.Manual):
     definition = """
     # Session
     mouse_id:   int            # unique to a each mouse
-    session_date: date           # session date given by the date of the session
+    session_date: date         # session date given by the date of the session
     """
     
 @schema
@@ -33,7 +32,7 @@ class Stimulus(dj.Imported):     # subclass of session
     trial_id: int              # trial identified by trial number
     ---
     visori: int                # Trial value of grating drift direction
-    viscon: int                # Trials value indicating the contrast of visual stimuli
+    viscon: int                # Trial value indicating the contrast of visual stimuli
     """
            
     def make(self, key):
@@ -218,11 +217,27 @@ class TuningCurveFits(dj.Computed):
 #--------------------------------------------------------Models-------------------------------------------------------
 
 # model function 1
-def model_fun1(x, theta): 
+def model_fun1(x, theta):
+    """
+    Model: von Mises with two fixed peak heights and take 4 parameters. 
+    inputs: 
+    x: an array   # list of params (values)
+    theta: float  # the orientation
+
+    Return: predicted mean activity of the given orientation
+    """
     return x[0] + (x[1] * np.exp(x[2] * np.cos(2.0 * (theta - x[3]))))
 
 # model function 2    
-def model_fun2(x, theta):    
+def model_fun2(x, theta):
+    """
+    Model: von Mises with two unfixed peak heights and take 5 parameters. 
+    inputs: 
+    x: an array  # list of params (values)
+    theta: float # the orientation
+
+    Return: predicted mean activity of the given orientation
+    """    
     return x[0] + (x[1] * np.exp(x[2] * np.cos(theta - x[3]))) + (x[4] * \
         np.exp(-x[2] * np.cos(theta - x[3])))
 
@@ -230,50 +245,189 @@ def model_fun2(x, theta):
 
 # auto populate: call this function to populate tables with new data
 def populate_new_data():
-    
+    """
+    This method is used for populating the 'Stimulus', \
+    'ActivityStatistics' and 'TuningCurveFits' tables. 
+    It calls the make methods implemented in the respective
+    classes.
+    """
     Stimulus.populate(display_progress=True)
     ActivityStatistics.populate(display_progress=True)
     TuningCurveFits.populate(display_progress=True)
     
     print("All tables are populated.")
 
+
 # helps pick a model based on input
-def pick_model(x, phi, model): 
+# (currently) it is called when ploting figures 
+def pick_model(x, phi, model):
+    """
+    This method is used to pick a model type based on the input \
+    When called it will run the model that was pick
+
+    inputs:
+    x: an array  # list of params (values)
+    phi: float   # orientation in radians
+    model: str   # a string with values 'm4p' or 'm5p' to indicate \
+                    which model you want to plot
+    return:
+    predicted mean activity per orientation
+    """
     if model == 'm5p':
         model = model_fun2(x, phi)
     else:
         model = model_fun1(x, phi)
     return model
 
-# Since not all sessions have two contrast
+# this method is called within the method
+# 'tuningCurvePerModel' Since not all sessions have two contrast
 # there are two possible values for contrast: low=0, high=1
 # we need to check if the entered contrast is in the session
 def check_contrast(mouse_id, session_date, viscon):
+    """"
+    The method checks if the contrast value entered is \
+    in the contrasts list of the given session.
 
-   # get the viscon from session
+    inputs:
+    mouse_id: int     # unique to each mouse
+    session_date: date  # session date given by the date of the session
+    viscon: int     # Trial value indicating the contrast of visual stimuli
+
+    return:
+    contrast
+    """
+
+   # get a list viscon values from session
     contrasts = [con['viscon'] for con in \
         (dj.U('viscon') 
         & (Stimulus 
         & f'mouse_id={mouse_id}' 
         & f'session_date="{session_date}"'))]
 
+    # chech if the contrast is in the list (contrasts)
+    # if not present, prompt user to enter the available
+    # contrast value else just return the entered contrast value
     while True:
         if viscon not in contrasts:
             print("The visual contrast you entered is not in this session")
             print(f'The available contrast(s) in AJ0{mouse_id}_{session_date} is: {contrasts}')
             answer = int(input('To continue, enter the available contrast options:'))
             if answer in contrasts:
-                new_con = answer
+                viscon = answer
+                print(f'your new visual contrast is: {viscon}')
                 break
-    print(f'your new visual contrast is: {new_con}')
-    return new_con
+        else:
+            break
+    return viscon
 
 
 #-------------------------------------plots---------------------------------------------------------
 
+# plot of tuning curves
+# this function plots both high and low contrasts on the same figure
+def tuningCurvePerCon(mouse_id, session_date, model):
+    """
+    Plots subplots of random neurons comparing different \
+    contrast values. The left and right y-axes have different scales
+
+    inputs:
+    mouse_id: int     # unique to each mouse
+    session_date: date  # session date given by the date of the session
+    model: varchar(5) # Type of model being fitted 
+
+    returns:
+    subplots of tuning curves
+    """
+
+
+    # get the number of neurons per_session
+    # and randonly sample neuroId from this range
+    num_of_plots = 9
+    n_neurons_sess = len(dj.U('neuro_id') & 
+        (Neuralactivity & f'mouse_id={mouse_id}' 
+            & f'session_date="{session_date}"'))
+    rand_nid = np.random.randint(0, n_neurons_sess, num_of_plots)
+
+    # get the orientations to use as x-axis ticks
+    ori_mean = [
+        o['visori']*(np.pi/180.0)
+        for o in (dj.U('visori') & ActivityStatistics)
+        ]
+
+    fig, axes = plt.subplots(3, 3, figsize=(15,10))
+    axes = axes.ravel()  # array to 1D
+    # loop through the randomly sampled neurons and axes
+    for n_id, ax1 in zip(rand_nid, axes):
+        # fetch the vison, parameters and mean activites from BD
+        viscon, params, mean_act = (TuningCurveFits \
+                    & f'mouse_id={mouse_id}' \
+                    & f'session_date="{session_date}"' \
+                    & f'neuro_id={n_id}' \
+                    & f'model_id="{model}"'\
+                ).fetch('viscon', 'params', 'act_mean_per_ori')
+
+        phi = np.linspace(0,2*np.pi, 100)
+
+        # plot low (or whatever is present if len(viscon) == 1) viscon plots
+        color = 'tab:grey'
+        lowConMean = ax1.plot(ori_mean, mean_act[0], \
+            label='mean_act_con_0', 
+            color=color, 
+            ls='--')
+        y0 = pick_model(params[0], phi, f'{model}')
+        color = 'tab:red'
+        ax1.set_title(f'Neuron {n_id}')
+        ax1.set_xticks([0, 1, 2, 3, 4, 5, 6, 7])
+        ax1.set_xticklabels([45, 90, 135, 180, 225, 270, 315, 360])
+        ax1.set_xlabel('Orientation($\\Theta$)')
+        ax1.set_ylabel('$\\Delta$F/F', color=color)
+        ax1.tick_params(axis='y', labelcolor=color)
+        lowConPlot = ax1.plot(phi, y0, label=f'viscon={viscon[0]}', color=color)
+
+        # plot high viscon 
+        if len(viscon) > 1:
+            # high vicon plots
+            ax2 = ax1.twinx()   # instantiate a second axes that shares the same x-axis
+            color = 'tab:grey'
+            highConMean = ax2.plot(ori_mean, mean_act[1], 
+                label='mean_act_con_1', 
+                color=color,
+                ls='-'
+            )
+            y1 = pick_model(params[1], phi, f'{model}')
+            color = 'tab:blue'
+            ax2.tick_params(axis='y', labelcolor=color)
+            highConPlot = ax2.plot(phi, y1, label=f'viscon={viscon[1]}', color=color)
+            # labels for the legend for both contrasts
+            leg = lowConMean + lowConPlot + highConMean + highConPlot 
+        else:
+            leg = lowConMean + lowConPlot  # labels for the legend for single contrast
+
+    labs = [l.get_label() for l in leg] # get labels
+
+    fig.suptitle(
+        f"{num_of_plots} Randomly Fitted Tuning Curves for Model={model} in AJ0{mouse_id}_{session_date}",
+        y=1.05, fontsize='xx-large'
+    )
+    
+    fig.legend(leg, labs, loc='upper left')
+    fig.tight_layout()  # otherwise the right y-label is slightly clipped
+    plt.show()
 
 # plot of tuning curves
-def tuning_curve_plots(mouse_id, session_date, viscon):
+def tuningCurvePerModel(mouse_id, session_date, viscon):
+    """
+    Plots subplots of random neurons comparing different \
+    contrast values. The left and right y-axes have different scales
+
+    inputs:
+    mouse_id: int     # unique to each mouse
+    session_date: date  # session date given by the date of the session
+    viscon: int     # trial value indicating the contrast of visual stimuli
+
+    returns:
+    subplots of tuning curves
+    """
 
     # Since not all sessions have two contrast
     # we need to check if the entered contrast is in the session
@@ -293,12 +447,11 @@ def tuning_curve_plots(mouse_id, session_date, viscon):
         for o in (dj.U('visori') & ActivityStatistics)
         ]
 
-
     fig, axes = plt.subplots(4, 4, figsize=(15,10))
     axes = axes.ravel()  # array to 1D
-
+    # loop through the randomly sampled neurons and axes
     for n_id, ax in zip(rand_nid, axes):
-
+        # fetch the model, parameters and mean activites from BD
         model, params, mean_act = (TuningCurveFits \
                     & f'mouse_id={mouse_id}' \
                     & f'session_date="{session_date}"' \
@@ -308,6 +461,8 @@ def tuning_curve_plots(mouse_id, session_date, viscon):
 
         phi = np.linspace(0,2*np.pi, 100)
         ax.plot(ori_mean, mean_act[0], label='mean_activity')
+
+        # for each model and parameter set plot the tuning curve
         for model, params in zip(model, params):
             y = pick_model(params, phi, f'{model}')
          
@@ -345,83 +500,3 @@ def tuning_curve_plots(mouse_id, session_date, viscon):
         )
     # Tweak spacing to prevent clipping of ylabel
     axfig.yaxis.set_label_coords(-0.05,0.5)
-    
-
-# plot of tuning curves
-# this function plots both high and low contrasts on the same figure
-def tuningCurvePlotsPerCon(mouse_id, session_date, model):
-
-
-    # get the number of neurons per_session
-    # and randonly sample neuroId from this range
-    num_of_plots = 9
-    n_neurons_sess = len(dj.U('neuro_id') & 
-        (Neuralactivity & f'mouse_id={mouse_id}' 
-            & f'session_date="{session_date}"'))
-    rand_nid = np.random.randint(0, n_neurons_sess, num_of_plots)
-
-    # get the orientations to use as x-axis ticks
-    ori_mean = [
-        o['visori']*(np.pi/180.0)
-        for o in (dj.U('visori') & ActivityStatistics)
-        ]
-
-
-    fig, axes = plt.subplots(3, 3, figsize=(15,10))
-    axes = axes.ravel()  # array to 1D
-
-    for n_id, ax1 in zip(rand_nid, axes):
-
-        viscon, params, mean_act = (TuningCurveFits \
-                    & f'mouse_id={mouse_id}' \
-                    & f'session_date="{session_date}"' \
-                    & f'neuro_id={n_id}' \
-                    & f'model_id="{model}"'\
-                ).fetch('viscon', 'params', 'act_mean_per_ori')
-
-        phi = np.linspace(0,2*np.pi, 100)
-
-        # low viscon plots
-        color = 'tab:grey'
-        raw_means1 = ax1.plot(ori_mean, mean_act[0], \
-            label='mean_act_con_0', 
-            color=color, 
-            ls='--')
-        y0 = pick_model(params[0], phi, f'{model}')
-        color = 'tab:red'
-        ax1.set_xticks([0, 1, 2, 3, 4, 5, 6, 7])
-        ax1.set_xticklabels([45, 90, 135, 180, 225, 270, 315, 360])
-        ax1.set_xlabel('Orientation($\\Theta$)')
-        ax1.set_ylabel('$\\Delta$F/F', color=color)
-        ax1.tick_params(axis='y', labelcolor=color)
-        pred1 = ax1.plot(phi, y0, label=f'viscon={viscon[0]}', color=color)
-
-        # plot other contrast
-        if len(viscon) > 1:
-            # high vicon plots
-            ax2 = ax1.twinx()   # instantiate a second axes that shares the same x-axis
-            color = 'tab:grey'
-            #ax2.set_ylabel('$\\Delta$F/F', color=color)
-            raw_means2 = ax2.plot(ori_mean, mean_act[1], 
-                label='mean_act_con_1', 
-                color=color,
-                ls='-'
-            )
-            y1 = pick_model(params[1], phi, f'{model}')
-            color = 'tab:blue'
-            ax2.tick_params(axis='y', labelcolor=color)
-            pred2 = ax2.plot(phi, y1, label=f'viscon={viscon[1]}', color=color)
-            leg = raw_means1 + pred1 + raw_means2 + pred2
-        else:
-            leg = raw_means1 + pred1
-
-    labs = [l.get_label() for l in leg]
-
-    fig.suptitle(
-        f"{num_of_plots} Randomly Fitted Tuning Curves for Model={model} in AJ0{mouse_id}_{session_date}",
-        y=1.05, fontsize='xx-large'
-    )
-    
-    fig.legend(leg, labs, loc='upper left')
-    fig.tight_layout()  # otherwise the right y-label is slightly clipped
-    plt.show()
